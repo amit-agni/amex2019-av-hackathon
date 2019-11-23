@@ -11,7 +11,7 @@ competition as I was working on another project during the same period.
 With limited feature engineering and model fine tuning I got a rank of
 434/1000 with a LB AUC score of 0.797
 
-The data schema was as below :
+The data schema was given as below :
 ![](/Mac%20Backup/OneDrive/R/Competitions/AV/20190928_Amex-campaigns/400_extras/Amexpert2019_Schema_diagram.png)
 
 ### TO DO : My approach
