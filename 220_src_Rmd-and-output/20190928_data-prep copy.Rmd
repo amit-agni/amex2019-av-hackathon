@@ -1,0 +1,1407 @@
+---
+title: "Data Prep and Model"
+author: "Amit Agni"
+date: "28/09/2019"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+if(!require(pacman)) { install.packages("pacman"); library(pacman)}
+p_load(data.table,tidyverse,tictoc,lubridate,here)
+p_load(janitor,DataExplorer)
+p_load(caret,googledrive,xgboost,DiagrammeR,rBayesianOptimization,GA,ROCR,PRROC)
+
+
+#remove scientific notation in printing 
+options(scipen=999) 
+#Revert back : options(scipen=0) 
+source(here::here("210_src_R-scripts-functions","functions","misc_functions.R"))
+source(here::here("210_src_R-scripts-functions","functions","db_functions.R"))
+source(here::here("210_src_R-scripts-functions","functions","to_na.R"))
+rm(list = ls())
+gc()
+
+
+```
+
+
+# See the metric is AUC, so the best you can get from AUC is by submitting probabilities (edited) 
+# Selling Price : Final sales value after discount.
+
+
+### Data Load
+
+```{r}
+filenames <- list.files(here('100_data_raw-input'),pattern = '*.csv')
+
+###Load all files
+for(i in filenames){
+    ##data frame name with only the census table names
+    df_name <- strsplit(i,"\\.")[[1]][1]
+    assign(df_name, fread(here("100_data_raw-input",i)))
+}
+
+table(train$redemption_status)
+77640/729
+
+#Basic prep
+campaign_data[,`:=`(start_date = lubridate::dmy(start_date)
+                   ,end_date = lubridate::dmy(end_date))]
+
+customer_transaction_data[,date := ymd(date)]
+
+
+
+#Club some of the item categories
+item_data[,.N,category][order(-N)][N<385]$category
+item_data[category %in% item_data[,.N,category][order(-N)][N<385]$category
+          ,category := 'Miscellaneous']
+table(item_data$category)
+
+
+customer_demographics[marital_status == '',marital_status:= 'Not disclosed']
+customer_demographics[no_of_children == '', no_of_children:= 0]
+customer_demographics$rented <- as.factor(customer_demographics$rented)
+
+
+#xgb softmax needs class to start from 0
+customer_demographics[,income_bracket := if_else(income_bracket %in% c(8,9,10,11,12),7L,income_bracket)]
+customer_demographics[,income_bracket := income_bracket - 1]
+
+#customer_demographics$income_bracket <- as.factor(customer_demographics$income_bracket)
+
+
+## Family size convert to integer and -1 for softmax
+table(customer_demographics$family_size)
+customer_demographics[,family_size:= if_else(family_size == '5+',5,as.numeric(family_size))-1]
+
+
+
+# Cleanup Marital status 
+customer_demographics[,marital_status_flag := case_when(marital_status == 'Not disclosed' ~ 1
+                                                        ,family_size != '1' & marital_status == 'Single' ~ 1
+                                                        ,TRUE ~ 0)]
+customer_demographics[
+                      ,marital_status := case_when(
+                        family_size == 0 & marital_status == 'Not disclosed' ~ 'Single'
+                        ,family_size != 0 & marital_status == 'Not disclosed' ~ 'Separated'
+                        ,family_size != 0 & marital_status == 'Single' ~ 'Separated'
+                        ,TRUE ~ marital_status)]
+
+
+#no of children flag
+customer_demographics[,no_of_children_flag := case_when(family_size == '2' & no_of_children == 1 ~ 1
+                                                        ,family_size == '3' & no_of_children == 2 ~ 1
+                                                        ,TRUE ~ 0)]
+#no of children for softmax
+table(customer_demographics$no_of_children,customer_demographics$family_size)
+str(customer_demographics)
+
+customer_demographics[,no_of_children := if_else(no_of_children == '3+',3,as.numeric(no_of_children))]
+
+```
+
+
+Predict No of children
+```{r}
+no_of_children <- customer_demographics[,.(customer_id,no_of_children)]
+
+
+train_test_cust <- unique(unique(train$customer_id)
+                         ,unique(test$customer_id))
+
+#customer_transaction_data[,sum(selling_price),strftime(date,format = "01-%m-%y")]
+
+cust_tran <- customer_transaction_data[date >= '2012-06-01' & customer_id %in% train_test_cust]
+cust_tran[,`:=`(
+  FE_isBOM = if_else(date == floor_date(date,'month'),'Y','N')
+  ,FE_isEOM = if_else(date == ceiling_date(date,'month')-1,'Y','N')
+  ,FE_isWE = if_else(wday(date,week_start=1) %in% c(6,7),'Y','N'))]
+
+                                      
+DT <- merge(cust_tran
+            ,no_of_children
+            ,by = 'customer_id'
+            ,all.x = TRUE)
+
+DT <- merge(DT
+            ,item_data[,.(item_id,brand_type,category)]
+            ,by = 'item_id'
+            ,all.x = TRUE)
+
+
+#Avg selling price at different levels
+#one by one
+DT_dcast <- data.table()
+for(i in c("FE_isWE","FE_isBOM","FE_isEOM","brand_type","category")){
+    DT_dcast  <- cbind(DT_dcast
+                             ,dcast(DT
+                                    ,customer_id + no_of_children ~ paste0(i,"_",get(i))
+                                    ,value.var = "selling_price"
+                                    ,fun.aggregate = function(x)
+                                      avg_tran_price = sum(x,na.rm = TRUE)/length(x)
+                                    )
+                       )
+    
+}
+
+cid <- DT_dcast$customer_id
+incbrk <- DT_dcast$no_of_children
+
+DT_dcast <- DT_dcast[,-c("customer_id","no_of_children")]
+
+DT_dcast$customer_id <- cid
+DT_dcast$no_of_children <- incbrk
+
+cols <- colnames(DT_dcast)
+
+source(here::here("210_src_R-scripts-functions","functions","to_na.R"))
+DT_dcast <- DT_dcast[,lapply(.SD,to_na),.SDcols = cols]
+
+str(DT_dcast)
+
+######### Add already predicted family size to this table ######
+cust_family_size <- readRDS(file=here('110_data_intermediate','cust_family_size.RDS'))
+
+DT_dcast <- merge(DT_dcast
+                  ,cust_family_size
+                  ,by = 'customer_id'
+                  ,all.x = TRUE)
+
+table(DT_dcast$family_size,DT_dcast$no_of_children,useNA = 'ifany')
+#Possible issues with no of children flag
+customer_demographics[,no_of_children_flag := case_when(family_size == '2' & no_of_children == 1 ~ 1
+                                                        ,family_size == '3' & no_of_children == 2 ~ 1
+                                                        ,TRUE ~ 0)]
+
+
+table(DT_dcast$no_of_children,useNA = "always")
+
+```
+
+
+Predict famsize
+```{r eval = FALSE}
+
+famsize <- customer_demographics[,.(customer_id,family_size)]
+
+
+train_test_cust <- unique(unique(train$customer_id)
+                         ,unique(test$customer_id))
+
+#customer_transaction_data[,sum(selling_price),strftime(date,format = "01-%m-%y")]
+
+cust_tran <- customer_transaction_data[date >= '2012-06-01' & customer_id %in% train_test_cust]
+cust_tran[,`:=`(
+  FE_isBOM = if_else(date == floor_date(date,'month'),'Y','N')
+  ,FE_isEOM = if_else(date == ceiling_date(date,'month')-1,'Y','N')
+  ,FE_isWE = if_else(wday(date,week_start=1) %in% c(6,7),'Y','N'))]
+
+                                      
+DT <- merge(cust_tran
+            ,famsize
+            ,by = 'customer_id'
+            ,all.x = TRUE)
+
+DT <- merge(DT
+            ,item_data[,.(item_id,brand_type,category)]
+            ,by = 'item_id'
+            ,all.x = TRUE)
+
+
+#Avg selling price at different levels
+#one by one
+DT_dcast <- data.table()
+for(i in c("FE_isWE","FE_isBOM","FE_isEOM","brand_type","category")){
+    DT_dcast  <- cbind(DT_dcast
+                             ,dcast(DT
+                                    ,customer_id + family_size ~ paste0(i,"_",get(i))
+                                    ,value.var = "selling_price"
+                                    ,fun.aggregate = function(x)
+                                      avg_tran_price = sum(x,na.rm = TRUE)/length(x)
+                                    )
+                       )
+    
+}
+
+cid <- DT_dcast$customer_id
+incbrk <- DT_dcast$family_size
+
+DT_dcast <- DT_dcast[,-c("customer_id","family_size")]
+
+DT_dcast$customer_id <- cid
+DT_dcast$family_size <- incbrk
+
+cols <- colnames(DT_dcast)
+
+source(here::here("210_src_R-scripts-functions","functions","to_na.R"))
+DT_dcast <- DT_dcast[,lapply(.SD,to_na),.SDcols = cols]
+
+str(DT_dcast)
+table(DT_dcast$family_size,useNA = "always")
+
+```
+
+
+run xgb - famsize
+```{r eval = FALSE}
+
+#Train and CV set
+my_train <- DT_dcast[!is.na(family_size)]
+my_train_labels <- my_train$family_size
+my_train$family_size <- NULL
+my_train$customer_id <- NULL
+
+dummies <- dummyVars(~., data = my_train, fullRank = TRUE)
+my_train <- predict(dummies, newdata = my_train)
+
+my_train <- xgb.DMatrix(my_train, label = my_train_labels)
+
+#Test set
+my_test <- DT_dcast[is.na(family_size)]
+my_test$family_size <- NULL
+test_cust_ids <- my_test$customer_id
+my_test$customer_id <- NULL
+
+
+dummies <- dummyVars(~., data = my_test,fullRank = TRUE)
+my_test <- predict(dummies, newdata = my_test)
+
+my_test <- xgb.DMatrix(my_test)
+
+#CV
+
+# temp <-data.frame()
+# for(i in seq(10,200,10)){
+xgb_cv <- xgb.cv(
+    params = list(
+             booster = "gbtree"
+            ,objective = "multi:softprob"
+            #,objective = "reg:logistic"
+            ,eval_metric = "mlogloss"
+            ,num_class = length(unique(DT$family_size))
+        ,eta = 0.01
+        ,max_depth=4
+        #,gamma = 30
+        ,min_child_weight = 150
+        #,subsample = 0.9
+        #,colsample_bytree = 0.8
+        #,alpha = 0.5
+        #,scale_pos_weight = 77.9011
+        #,max_delta_step = 3
+        )
+,data = my_train
+,nrounds =10000
+,early_stopping_rounds =2
+,verbose = TRUE
+#,prediction = TRUE
+,nfold = 5
+,stratified = TRUE
+,showsd = FALSE)
+
+# temp <- rbind(temp,cbind(xgb_cv$evaluation_log[nrow(xgb_cv$evaluation_log),],i))
+# }
+# beepr::beep(8)
+
+# Plot learning curve
+ggplot(melt(xgb_cv$evaluation_log,
+       measure.vars = c("train_mlogloss_mean","test_mlogloss_mean"))) +
+    geom_line(aes(x=iter, y=value, color=variable)) 
+    #scale_y_continuous(limits = c(0.96,1))  
+
+#Model to predict
+xgb_model <- xgboost(
+  params = xgb_cv$params
+  ,data = my_train
+  ,nrounds = xgb_cv$best_iteration
+  ,verbose = TRUE)
+
+### predit on test
+pred <- predict(xgb_model,newdata = my_test,reshape = T) 
+pred <- data.frame(pred)
+
+pred
+
+colnames(pred) <- seq(0,5,1)
+
+test_frame <- data.table(customer_id = test_cust_ids
+                         ,family_size = as.numeric(colnames(pred)[max.col(pred,ties.method="first")]))
+
+train_frame <- DT_dcast[!is.na(family_size),.(customer_id,family_size)]
+
+
+cust_family_size <- rbind(train_frame,test_frame)
+
+saveRDS(cust_family_size,file=here('110_data_intermediate','cust_family_size.RDS'))
+
+```
+
+
+Predict - income bracket
+```{r eval = FALSE}
+
+cust_income <- customer_demographics[,.(customer_id,income_bracket)]
+
+train_test_cust <- unique(unique(train$customer_id)
+                         ,unique(test$customer_id))
+
+#customer_transaction_data[,sum(selling_price),strftime(date,format = "01-%m-%y")]
+
+cust_tran <- customer_transaction_data[date >= '2012-06-01' & customer_id %in% train_test_cust]
+cust_tran[,`:=`(
+  FE_isBOM = if_else(date == floor_date(date,'month'),'Y','N')
+  ,FE_isEOM = if_else(date == ceiling_date(date,'month')-1,'Y','N')
+  ,FE_isWE = if_else(wday(date,week_start=1) %in% c(6,7),'Y','N'))]
+
+                                      
+DT <- merge(cust_tran
+            ,cust_income
+            ,by = 'customer_id'
+            ,all.x = TRUE)
+
+DT <- merge(DT
+            ,item_data[,.(item_id,brand_type,category)]
+            ,by = 'item_id'
+            ,all.x = TRUE)
+
+
+#Avg selling price at different levels
+#one by one
+DT_dcast <- data.table()
+for(i in c("FE_isWE","FE_isBOM","FE_isEOM","brand_type","category")){
+    DT_dcast  <- cbind(DT_dcast
+                             ,dcast(DT
+                                    ,customer_id + income_bracket ~ paste0(i,"_",get(i))
+                                    ,value.var = "selling_price"
+                                    ,fun.aggregate = function(x)
+                                      avg_tran_price = sum(x,na.rm = TRUE)/length(x)
+                                    )
+                       )
+    
+}
+
+cid <- DT_dcast$customer_id
+incbrk <- DT_dcast$income_bracket
+
+DT_dcast <- DT_dcast[,-c("customer_id","income_bracket")]
+
+DT_dcast$customer_id <- cid
+DT_dcast$income_bracket <- incbrk
+
+source(here::here("210_src_R-scripts-functions","functions","to_na.R"))
+DT_dcast <- DT_dcast[,lapply(.SD,to_na),.SDcols = cols]
+
+
+# # Average sellling price 
+# DT[!is.na(income_bracket),.(selling_price=sum(selling_price)/length(item_id))
+#    ,.(customer_id,income_bracket)] %>%
+#   ggplot(aes(x=factor(income_bracket),y=selling_price,group = income_bracket)) +
+#   geom_boxplot() +
+#   coord_cartesian(ylim = c(0,200))
+# 
+# # Average sellling price  over weekend
+# DT[!is.na(income_bracket),.(selling_price=sum(selling_price)/length(item_id))
+#    ,.(customer_id,income_bracket,FE_isWE)] %>%
+#   ggplot(aes(x=factor(income_bracket),y=selling_price,group = income_bracket)) +
+#   geom_boxplot() +
+#   coord_cartesian(ylim = c(0,200)) +
+#   facet_wrap(~FE_isWE)
+  
+
+
+
+```
+
+
+
+run xgb - income bracket
+```{r eval = FALSE}
+
+#Train and CV set
+my_train <- DT_dcast[!is.na(income_bracket)]
+my_train_labels <- my_train$income_bracket
+my_train$income_bracket <- NULL
+my_train$customer_id <- NULL
+
+dummies <- dummyVars(~., data = my_train, fullRank = TRUE)
+my_train <- predict(dummies, newdata = my_train)
+
+my_train <- xgb.DMatrix(my_train, label = my_train_labels)
+
+#Test set
+my_test <- DT_dcast[is.na(income_bracket)]
+my_test$income_bracket <- NULL
+test_cust_ids <- my_test$customer_id
+my_test$customer_id <- NULL
+
+
+dummies <- dummyVars(~., data = my_test,fullRank = TRUE)
+my_test <- predict(dummies, newdata = my_test)
+
+my_test <- xgb.DMatrix(my_test)
+
+#CV
+
+# temp <-data.frame()
+# for(i in seq(10,200,10)){
+xgb_cv <- xgb.cv(
+    params = list(
+             booster = "gbtree"
+            ,objective = "multi:softprob"
+            #,objective = "reg:logistic"
+            ,eval_metric = "mlogloss"
+            ,num_class = length(unique(DT$income_bracket))
+        ,eta = 0.01
+        ,max_depth=4
+        #,gamma = 30
+        ,min_child_weight = 120
+        #,subsample = 0.9
+        #,colsample_bytree = 0.8
+        #,alpha = 0.5
+        #,scale_pos_weight = 77.9011
+        #,max_delta_step = 3
+        )
+,data = my_train
+,nrounds =10000
+,early_stopping_rounds =2
+,verbose = TRUE
+#,prediction = TRUE
+,nfold = 5
+,stratified = TRUE
+,showsd = FALSE)
+
+# temp <- rbind(temp,cbind(xgb_cv$evaluation_log[nrow(xgb_cv$evaluation_log),],i))
+# }
+# beepr::beep(8)
+
+# Plot learning curve
+ggplot(melt(xgb_cv$evaluation_log,
+       measure.vars = c("train_mlogloss_mean","test_mlogloss_mean"))) +
+    geom_line(aes(x=iter, y=value, color=variable)) 
+    #scale_y_continuous(limits = c(0.96,1))  
+
+#Model to predict
+xgb_model <- xgboost(
+  params = xgb_cv$params
+  ,data = my_train
+  ,nrounds = xgb_cv$best_iteration
+  ,verbose = TRUE)
+
+### predit on test
+pred <- predict(xgb_model,newdata = my_test,reshape = T) 
+pred <- data.frame(pred)
+
+pred
+colnames(pred) <- seq(0,ncol(pred)-1,1)
+
+test_frame <- data.table(customer_id = test_cust_ids
+                         ,income_bracket = as.numeric(colnames(pred)[max.col(pred,ties.method="first")]))
+
+train_frame <- DT_dcast[!is.na(income_bracket),.(customer_id,income_bracket)]
+
+
+cust_income_bracket <- rbind(train_frame,test_frame)
+
+saveRDS(cust_income_bracket,file=here('110_data_intermediate','cust_income_bracket.RDS'))
+
+```
+
+
+
+
+```{r}
+
+### Dates Feature Engineering
+customer_transaction_data[,`:=`(FE_month = month(date,label = TRUE)
+                                ,FE_dow = wday(date,week_start = 1,label = TRUE)
+                                ,FE_isWE = if_else(wday(date,week_start=1) %in% c(6,7),'Y','N')
+                                ,FE_isBOM = if_else(date == floor_date(date,'month'),'Y','N')
+                                ,FE_isEOM = if_else(date == ceiling_date(date,'month')-1,'Y','N')
+                                #,FE_WofY = week(date)
+                                )]
+
+
+# ### Discount percentages and binning them
+# customer_transaction_data[,`:=`(other_discount_pct = round(100*abs(other_discount)/(selling_price+abs(other_discount)+abs(coupon_discount)),1)
+#                             #    ,coupon_discount_pct = round(100*abs(coupon_discount)/(selling_price+abs(other_discount)+abs(coupon_discount)),1)
+#                                 )]
+# 
+# lower_bound <- seq(0,90,10)
+# customer_transaction_data$other_discount_pct_lvl <- findInterval(customer_transaction_data$other_discount_pct, lower_bound) -1
+# #customer_transaction_data$coupon_discount_pct_lvl <- findInterval(customer_transaction_data$coupon_discount_pct, lower_bound) -1
+
+
+
+### Campaign dates FE
+# campaign_data[,`:=`(FE_month_st = month(start_date,label = TRUE)
+#                                 ,FE_dow_st = wday(start_date,week_start = 1,label = TRUE)
+#                                 ,FE_isWE_st = if_else(wday(start_date,week_start=1) %in% c(6,7),'Y','N')
+#                                 #,FE_isBOM_st = if_else(start_date == floor_date(start_date,'month'),'Y','N')
+#                                 #,FE_isEOM_st = if_else(start_date == ceiling_date(start_date,'month')-1,'Y','N')
+#                                 #,FE_WofY_st = week(start_date)
+#                                 )]
+
+campaign_data[,`:=`(FE_month_end = month(end_date,label = TRUE)
+                                ,FE_dow_end = wday(end_date,week_start = 1,label = TRUE)
+                                ,FE_isWE_end = if_else(wday(end_date,week_start=1) %in% c(6,7),'Y','N')
+                                ,FE_isBOM_end = if_else(end_date == floor_date(end_date,'month'),'Y','N')
+                                ,FE_isEOM_end = if_else(end_date == ceiling_date(end_date,'month')-1,'Y','N')
+                                #,FE_WofY_end = week(end_date)
+                                )]
+
+campaign_data[,campaign_len := as.numeric(end_date - start_date)]
+lower_bound <- seq(1,100,7)
+campaign_data$campaign_len_lvl <- findInterval(campaign_data$campaign_len, lower_bound) 
+campaign_data$campaign_len <- NULL
+
+
+
+
+```
+
+
+Coupon profile NEW
+
+```{r}
+
+train_test_cpn <- unique(unique(train$coupon_id),unique(test$coupon_id))
+
+temp <- merge(coupon_item_mapping
+                        ,item_data
+                        ,by = 'item_id'
+              ,all.x = TRUE)
+
+#one by one
+cpn_item_dcast <- data.table()
+for(i in c("brand_type","category")){
+    cpn_item_dcast  <- cbind(cpn_item_dcast
+                             ,dcast(temp
+                                    ,coupon_id ~ paste0(i,"_",get(i))
+                                    ,value.var = c("item_id")
+                                    ,fun.aggregate = length))
+}
+
+cpn_ids <- cpn_item_dcast$coupon_id
+cpn_item_dcast <- cpn_item_dcast[,-"coupon_id"]
+cpn_item_dcast$coupon_id <- cpn_ids
+
+
+
+```
+
+
+
+
+Customer Transaction summary
+```{r }
+
+train_test_cust <- unique(unique(train$customer_id)
+                         ,unique(test$customer_id))
+
+
+length(train_test_cust)
+
+
+cust_income <- customer_demographics[,.(customer_id,income_bracket)]
+
+train_test_cust <- unique(unique(train$customer_id)
+                         ,unique(test$customer_id))
+
+#customer_transaction_data[,sum(selling_price),strftime(date,format = "01-%m-%y")]
+
+cust_tran <- customer_transaction_data[date >= '2012-06-01' & customer_id %in% train_test_cust]
+cust_tran[,`:=`(FE_isBOM = if_else(date == floor_date(date,'month'),'Y','N')
+                ,FE_isEOM = if_else(date == ceiling_date(date,'month')-1,'Y','N')
+                ,FE_isWE = if_else(wday(date,week_start=1) %in% c(6,7),'Y','N'))]
+
+  
+DT <- merge(cust_tran
+            ,item_data[,.(item_id,brand_type,category)]
+            ,by = 'item_id'
+            ,all.x = TRUE)
+
+
+#Avg selling price at different levels
+#one by one
+DT_dcast <- data.table()
+for(i in c("FE_isWE","FE_isBOM","FE_isEOM","brand_type","category")){
+    DT_dcast  <- cbind(DT_dcast
+                             ,dcast(DT
+                                    ,customer_id ~ paste0(i,"_",get(i))
+                                    ,value.var = "selling_price"
+                                    ,fun.aggregate = function(x)
+                                      avg_tran_price = sum(x,na.rm = TRUE)/length(x)
+                                    )
+                       )
+    
+}
+
+cid <- DT_dcast$customer_id
+
+DT_dcast <- DT_dcast[,-c("customer_id")]
+
+DT_dcast$customer_id <- cid
+
+cols <- colnames(DT_dcast)
+source(here::here("210_src_R-scripts-functions","functions","to_na.R"))
+DT_dcast <- DT_dcast[,lapply(.SD,to_na),.SDcols = cols]
+
+
+cust_tran_profile <- DT_dcast
+
+
+
+
+```
+
+
+Merge ALL
+
+```{r}
+
+
+#Combine train and test
+train$flag <- 'TRAIN'
+test$flag <- 'TEST'
+test$redemption_status <- NA
+train_test <- rbind(train,test)
+
+cust_family_size <- readRDS(here('110_data_intermediate','cust_family_size.RDS'))
+cust_income_bracket <- readRDS(here('110_data_intermediate','cust_income_bracket.RDS'))
+
+
+train_test <- merge(train_test
+                    ,cust_family_size
+                    ,by='customer_id'
+                    ,all.x = TRUE)
+
+train_test <- merge(train_test
+                    ,cust_income_bracket
+                    ,by='customer_id'
+                    ,all.x = TRUE)
+
+train_test <- merge(train_test
+                    ,cust_tran_profile
+                    ,by='customer_id'
+                    ,all.x = TRUE)
+
+
+train_test <- merge(train_test
+                    ,cpn_item_dcast
+                    ,by='coupon_id'
+                    ,all.x = TRUE)
+
+str(train_test)
+
+train_test[,`:=`(family_size = as.factor(family_size)
+                 ,income_bracket = as.factor(income_bracket))]
+
+DT <- train_test
+
+
+table(DT$flag,DT$redemption_status)
+
+
+
+
+#Train and CV set
+my_train <- DT[flag == 'TRAIN']
+my_train_labels <- my_train$redemption_status
+my_train$redemption_status <- NULL
+
+my_train <- my_train[,-c("customer_id","id","campaign_id","coupon_id","flag")]
+
+
+
+dummies <- dummyVars(~., data = my_train, fullRank = TRUE)
+my_train <- predict(dummies, newdata = my_train)
+
+my_train <- xgb.DMatrix(my_train, label = my_train_labels)
+
+#Test set
+my_test <- DT[flag == 'TEST']
+my_test$redemption_status <- NULL
+test_ids <- my_test$id
+
+my_test <- my_test[,-c("customer_id","id","campaign_id","coupon_id","flag")]
+
+
+dummies <- dummyVars(~., data = my_test,fullRank = TRUE)
+my_test <- predict(dummies, newdata = my_test)
+
+my_test <- xgb.DMatrix(my_test)
+
+
+
+```
+
+xb CV NEW
+
+elapsed = 19.62	Round = 53	max_depth = 6.0000	gamma = 33.9685	colsample_bytree = 0.1709	scale_pos_weight = 27.0000	min_child_weight = 42.0000	subsample = 0.9000	Value = 0.8886 
+Stopping. Best iteration:
+[305]	train-auc:0.966513+0.001009	test-auc:0.896922+0.009835
+
+Gave Train 0.96 LB 0.79
+
+
+elapsed = 301.66	Round = 64	max_depth = 6.0000	gamma = 31.4324	colsample_bytree = 0.9000	scale_pos_weight = 21.0000	min_child_weight = 34.0000	subsample = 0.4356	Value = 0.9011 
+
+
+
+```{r}
+
+
+#CV
+
+# temp <-data.frame()
+# for(i in seq(10,200,10)){
+xgb_cv <- xgb.cv(
+    params = list(
+             booster = "gbtree"
+            #,objective = "reg:logistic"
+            ,objective = "binary:logistic"
+            ,eval_metric = "auc"
+        ,eta = 0.01
+        ,max_depth=4
+        ,gamma = 33.9685
+        ,colsample_bytree = 0.1709
+        ,scale_pos_weight = 27
+        ,min_child_weight = 42
+        ,subsample = 0.9
+        #,alpha = 0.5
+        #,max_delta_step = 8
+        )
+,data = my_train
+,nrounds =1000
+,early_stopping_rounds =10
+,verbose = TRUE
+#,prediction = TRUE
+,nfold = 4
+,stratified = TRUE
+,showsd = FALSE)
+
+# temp <- rbind(temp,cbind(xgb_cv$evaluation_log[nrow(xgb_cv$evaluation_log),],i))
+# }
+# beepr::beep(8)
+
+# Plot learning curve
+ggplot(melt(xgb_cv$evaluation_log,
+       measure.vars = c("train_auc_mean","test_auc_mean"))) +
+    geom_line(aes(x=iter, y=value, color=variable)) 
+    #scale_y_continuous(limits = c(0.96,1))  
+
+
+
+    
+#Model to predict
+xgb_model <- xgboost(
+  params = xgb_cv$params
+  ,data = my_train
+  ,nrounds = xgb_cv$best_iteration
+  ,verbose = TRUE)
+
+
+# Feature importance
+importance <- xgb.importance(model = xgb_model)
+importance[1:30]
+xgb.plot.importance(importance[1:30])
+
+
+### predit on test
+pred <- predict(xgb_model,newdata = my_test) 
+pred
+summary(pred)
+plot_histogram(pred)
+
+
+
+
+
+
+```
+
+
+
+Submission
+```{r}
+
+#get_unique_ids <- fread(here::here("100_data_raw-input","test.csv"))
+
+submit_kaggle <- as.data.frame(cbind(test_ids,pred))
+colnames(submit_kaggle) <- c("id"
+                             ,"redemption_status")
+
+write.csv(submit_kaggle
+          ,file = here("300_output"
+                       ,paste0(strftime(Sys.time(), format="%Y%m%d_%H%M%S"),"_submit_XGB",".csv"))
+          ,row.names = FALSE)
+
+
+```
+
+
+
+
+
+Bayesian
+```{r}
+
+# Test has to be second in the list else, XGB uses train metric for early stopping
+# watchlist <- list(train = my_train,test = my_test)
+
+
+opt_fn <- function(max_depth,gamma,colsample_bytree,scale_pos_weight,min_child_weight,subsample) {
+    
+        xgb_cv <- xgb.cv(
+            params = list(
+                     booster = "gbtree"
+                    ,objective = "binary:logistic"
+                    ,eval_metric = "auc"
+                ,eta = 0.01
+                ,max_depth=max_depth
+                ,gamma = gamma
+                ,colsample_bytree=colsample_bytree
+                ,scale_pos_weight=scale_pos_weight
+                ,min_child_weight=min_child_weight
+                ,subsample=subsample
+                )
+        ,data = my_train
+        ,nrounds =800
+        ,early_stopping_rounds =10
+        ,verbose = TRUE
+        ,prediction = TRUE
+        ,nfold = 2
+        ,stratified = TRUE
+        ,showsd = FALSE)
+
+    
+        list(#Score = xgb_model$best_score
+        Score = xgb_cv$evaluation_log[xgb_cv$best_iteration]$test_auc_mean 
+        # For Regression minimise rmse
+        #Score = -xgb_model$evaluation_log[xgb_model$best_iteration]$test_rmse
+        ,Pred = xgb_cv$pred)
+}
+
+
+opt_res <- BayesianOptimization(opt_fn
+                                ,bounds = list(
+                                  #  nrounds = 150
+                                  #  ,eta = 0.1
+                                    max_depth = c(3L,6L)
+                                    ,gamma = c(0,200)
+                                    ,colsample_bytree = c(0.1,0.9)
+                                    ,scale_pos_weight = c(5L,50L)
+                                    ,min_child_weight=c(1L,100L)
+                                    ,subsample = c(0.1,0.9))
+                                ,init_grid_dt = NULL
+                                ,init_points = 10
+                                ,n_iter = 100
+                                ,acq = "ucb"
+                                ,kappa = 2.576
+                                #,eps = 2
+                                ,verbose = TRUE)
+
+
+
+
+```
+
+
+
+
+
+OLD CODE
+
+GOLD !!!!!!
+        ,eta = 0.01
+        ,max_depth=3
+        ,gamma = 100
+        ,min_child_weight = 100
+        ,subsample = 0.6
+        ,colsample_bytree = 0.6
+        #,alpha = 0.5
+        ,scale_pos_weight = 10
+
+
+
+
+
+```{r}
+
+#which(lapply(DT,nlevels)==1) == TRUE
+
+#remove the id columns
+DT <- DT[,-c("customer_id","id","campaign_id","coupon_id","start_date","end_date")]
+
+str(DT)
+
+
+
+DT <- DT[flag == "TRAIN",]
+DT$flag <- NULL
+
+
+index <- createDataPartition(y=DT$redemption_status, p=0.8
+                             , list=FALSE) 
+my_train <- DT[index,]
+my_test <- DT[-index,]
+
+table(my_train$redemption_status)
+62092/604
+
+
+my_train_labels <- my_train$redemption_status
+my_train$redemption_status <- NULL
+
+my_test_labels <- my_test$redemption_status
+my_test$redemption_status <- NULL
+
+dummies <- dummyVars(~., data = my_train, fullRank = TRUE)
+my_train <- predict(dummies, newdata = my_train)
+
+dummies <- dummyVars(~., data = my_test,fullRank = TRUE)
+my_test <- predict(dummies, newdata = my_test)
+#my_test_4xgb_explainer <- my_test
+
+my_train <- xgb.DMatrix(my_train, label = my_train_labels)
+my_test <- xgb.DMatrix(my_test, label = my_test_labels)
+
+watchlist <- list(train = my_train, test = my_test)
+
+
+```
+
+
+elapsed = 52.80	Round = 94	max_depth = 3.0000	gamma = 0.0000	colsample_bytree = 0.3684	max_delta_step = 10.8719	min_child_weight = 25.0000	subsample = 0.9000	Value = 0.9090 
+
+elapsed = 66.30	Round = 82	max_depth = 4.0000	gamma = 2.2197	colsample_bytree = 0.5239	max_delta_step = 9.6281	min_child_weight = 1.0000	subsample = 0.9000	Value = 0.9233 
+
+elapsed = 59.56	Round = 59	max_depth = 5.0000	gamma = 0.0000	colsample_bytree = 0.3949	max_delta_step = 2.7728	min_child_weight = 9.0000	subsample = 0.4180	Value = 0.9237 
+
+
+
+Manual parameters
+```{r}
+
+
+xgb_model <- xgb.train(
+    params = list(
+             booster = "gbtree"
+            ,objective = "binary:logistic"
+            #,objective = "reg:logistic"
+            ,eval_metric = "auc"
+        ,eta = 0.01
+        ,max_depth=5
+        #,gamma = 2.2197
+        ,colsample_bytree = 0.2
+        ,max_delta_step =15
+        ,min_child_weight = 30
+        ,subsample = 0.2
+        #,alpha = 0.5
+        #,scale_pos_weight = 77.9011
+        )
+,data = my_train
+,watchlist = watchlist
+,nrounds = 300
+,early_stopping_rounds = 50
+,verbose = TRUE
+,prediction = TRUE) 
+
+
+
+# Plot learning curve
+ggplot(melt(xgb_model$evaluation_log,
+       measure.vars = c("train_auc","test_auc"))) +
+    geom_line(aes(x=iter, y=value, color=variable)) 
+    #scale_y_continuous(limits = c(0.96,1))  
+
+# Feature importance
+importance <- xgb.importance(model = xgb_model)
+importance[1:30]
+xgb.plot.importance(importance[1:30])
+
+
+#Predict on test
+pred <- predict(xgb_model,newdata = my_test) 
+summary(pred)
+
+
+plot_histogram(pred)
+
+# Learning : Manually updated the probs and see the impact on the curves
+pred <- data.table(pred=pred,my_test_labels=my_test_labels)[
+  my_test_labels==1,pred:=pred*1.2]$pred
+
+### ROCR Optimal cutoff
+fg <- pred[my_test_labels == 1]
+bg <- pred[my_test_labels == 0]
+
+roc_curve <- roc.curve(scores.class0 = fg, scores.class1 = bg, curve = T,max.compute = TRUE,min.compute = TRUE)
+roc_curve
+plot(roc_curve)
+
+pr_curve <- pr.curve(scores.class0 = fg, scores.class1 = bg, curve = T,max.compute = TRUE,min.compute = TRUE)
+pr_curve
+plot(pr_curve)
+
+table(pred = ifelse(pred>0.05,1,0),actual=my_test_labels)
+
+
+# Calculate AUC 
+rocr_pred <- prediction(labels = my_test_labels,predictions = ifelse(pred>0.05,1,0))
+perf.auc <- performance(rocr_pred, measure = "auc")
+unlist(perf.auc@y.values)
+
+perf <- performance(rocr_pred, measure = "tpr", x.measure = "fpr")
+plot(perf, main = "ROC curve",
+     col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+
+
+
+```
+
+
+
+
+### Train on whole train and submission
+
+
+```{r}
+
+
+my_train <- DT_bkup[flag == "TRAIN",]
+
+my_train <- my_train[,-c("customer_id","id","campaign_id","coupon_id","start_date","end_date")]
+my_train$flag <- NULL
+
+my_train_labels <- my_train$redemption_status
+my_train$redemption_status <- NULL
+
+dummies <- dummyVars(~., data = my_train, fullRank = TRUE)
+my_train <- predict(dummies, newdata = my_train)
+
+my_train <- xgb.DMatrix(my_train, label = my_train_labels)
+
+xgb_model <- xgboost(
+    params = list(
+             booster = "gbtree"
+            ,objective = "binary:logistic"
+            #,objective = "binary:hinge"
+            
+            ,eval_metric = "auc"
+        ,eta = 0.01
+        ,max_depth=5
+        #,gamma = 2.2197
+        ,colsample_bytree = 0.2
+        ,max_delta_step =15
+        ,min_child_weight = 30
+        ,subsample = 0.2
+        #,alpha = 0.5
+        #,scale_pos_weight = 77.9011
+        )
+,data = my_train
+,nrounds = 150
+,early_stopping_rounds = 15
+,verbose = TRUE
+,prediction = TRUE) 
+
+
+### submission
+my_test <- DT_bkup[flag == "TEST",]
+my_test <- my_test[,-c("customer_id","id","campaign_id","coupon_id","start_date","end_date")]
+my_test$flag <- NULL
+my_test$redemption_status <- NULL
+
+dummies <- dummyVars(~., data = my_test,fullRank = TRUE)
+my_test <- predict(dummies, newdata = my_test)
+
+my_test <- xgb.DMatrix(my_test)
+
+pred <- predict(xgb_model,newdata = my_test) 
+summary(pred)
+plot_histogram(pred)
+
+
+#pred <- ifelse(pred>0.03,1,0)
+
+
+```
+
+
+Submission
+```{r}
+
+#get_unique_ids <- fread(here::here("100_data_raw-input","test.csv"))
+
+submit_kaggle <- as.data.frame(cbind(test$id,pred))
+colnames(submit_kaggle) <- c("id"
+                             ,"redemption_status")
+
+write.csv(submit_kaggle
+          ,file = here("300_output"
+                       ,paste0(strftime(Sys.time(), format="%Y%m%d_%H%M%S"),"_submit_XGB_",".csv"))
+          ,row.names = FALSE)
+
+
+```
+
+
+
+Evaluation
+```{r}
+
+p_load(ROCR)
+pred <- prediction(labels = test_set$target,
+                   predictions = ifelse(prob_pred>0.1,1,0))
+perf <- performance(pred, measure = "tpr", x.measure = "fpr")
+plot(perf, main = "ROC curve",
+     col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+perf.auc <- performance(pred, measure = "auc")
+unlist(perf.auc@y.values)
+
+#[1] 0.5083798 (0.95 split)
+#[1] 0.507306 (0.75 split)
+
+perf.f <- performance(pred,measure ="f")
+unlist(perf.f@y.values)
+#[1]        NaN 0.04014870 0.07034948
+#[1]        NaN 0.03711442 0.07032977
+
+
+
+
+
+p_load(PRROC)
+fg <- predict.0$`1`[test$is_attributed == 1]
+bg <- predict.0$`1`[test$is_attributed == 0]
+# ROC Curve    
+roc <- roc.curve(scores.class0 = fg, scores.class1 = bg, curve = T)
+plot(roc)
+# PR Curve
+pr <- pr.curve(scores.class0 = fg, scores.class1 = bg, curve = T)
+plot(pr)
+test$predicted <- ifelse(predict.0$`1` > 0.75,1,0)
+table(pred = test$predicted,actual=test$is_attributed)
+
+
+```
+
+
+
+
+### Old code
+```{r}
+
+names(tt_cpn_profile)
+names(tt_cust_profile)
+
+tran_cpn_item <- merge(tran_item
+                       ,coupon_item_mapping
+                       ,by = 'item_id'
+                       ,all.x = TRUE
+                       ,allow.cartesian = TRUE)
+
+
+#final merge
+DT <- merge(tt_cpn_item
+              ,tran_cpn_item
+              ,by = c('customer_id','coupon_id','item_id')
+              ,all.x = TRUE) %>%
+  setDT()
+
+#Remove everything except temp
+#rm(list = ls()[ls() != "DT"])
+gc()
+
+DT_non_campaign <- DT[is.na(date)]
+DT <- DT[!is.na(date)]
+
+
+temp <- copy(DT)
+#DT<-temp
+
+toc()
+
+```
+
+
+### Process
+```{r}
+
+DT[,`:=`(start_date = lubridate::dmy(start_date)
+         ,end_date = lubridate::dmy(end_date)
+         ,date = lubridate::ymd(date))]
+
+DT[marital_status == '',marital_status:= 'Not disclosed']
+DT[no_of_children == '', no_of_children:= 'maybeNA']
+
+DT <- DT %>% mutate_if(is.character,as.factor) %>% setDT()
+
+DT$income_bracket <- as.factor(DT$income_bracket)
+DT$rented <- as.factor(DT$rented)
+
+str(DT)
+
+get_dupes(DT[,.N,.(id,coupon_id,campaign_id,customer_id)])
+
+
+table(DT$flag,DT$redemption_status)
+
+
+DT[,is_date_bet := if_else(date>=start_date & date <= end_date,'Y','N')]
+
+```
+
+
+
+### Process 
+```{r}
+str(campaign_data)
+#get_dupes(campaign_data,campaign_id)
+
+campaign_data[,`:=`(start_date = lubridate::dmy(start_date)
+                   ,end_date = lubridate::dmy(end_date)
+                   ,start_end = interval(start_date,end_date))]
+
+
+plot_bar(campaign_data)
+plot_histogram(campaign_data)
+
+min(campaign_data$start_date)
+max(campaign_data$end_date)
+
+
+#Campaigns run for
+t(t(table(campaign_data$end_date - campaign_data$start_date)))
+
+
+# #TO DO : use rolling joins to see if there are any interval overalaps
+# campaign_data[,start_end := lubridate::interval(start_date,end_date)]
+# 
+# all_intervals <- campaign_data$start_end
+# int1 <- campaign_data$start_end[1]
+# int1 == campaign_data$start_end 
+# length(which(int1 %within% all_intervals == TRUE))
+# 
+# campaign_data$is_bet_any_other <- NULL
+# campaign_data[,is_bet_any_other := length(which(start_end %within% all_intervals[start_end != all_intervals] == TRUE))]
+
+
+
+```
+
+### Customer demographics
+```{r}
+str(customer_demographics)
+# get_dupes(customer_demographics)
+# get_dupes(customer_demographics,customer_id)
+
+
+customer_demographics[customer_demographics == ''] <- NA
+
+customer_demographics <- customer_demographics %>%
+    mutate_if(is.character,as.factor)
+
+plot_bar(customer_demographics)
+plot_histogram(customer_demographics)
+
+plot_missing(customer_demographics)
+
+
+
+```
+
+
+### Item data
+```{r}
+str(item_data)
+
+plot_bar(item_data)
+plot_histogram(item_data)
+
+item_data <- item_data %>% mutate_if(is.character,as.factor)
+
+plot_correlation(item_data[,-1])
+
+get_dupes(item_data,item_id)
+
+
+```
+
+
+### Coupon Item
+
+```{r}
+
+str(coupon_item_mapping)
+plot_histogram(coupon_item_mapping)
+#get_dupes(coupon_item_mapping)
+
+head(get_dupes(coupon_item_mapping,coupon_id))
+head(get_dupes(coupon_item_mapping,item_id))
+
+
+```
+
+
+### Customer transaction
+
+```{r fig.width=12}
+str(customer_transaction_data)
+
+plot_histogram(customer_transaction_data)
+
+#unique(customer_transaction_data$date)
+customer_transaction_data[,date := ymd(date)]
+
+min(customer_transaction_data$date)
+max(customer_transaction_data$date)
+
+customer_transaction_data[,.(sale_amt = sum(selling_price,na.rm = TRUE))
+                          ,.(date)] %>%
+    ggplot() +
+    geom_line(aes(x=date,y=sale_amt)) +
+    scale_x_date(date_breaks = "weeks") +
+    theme_minimal() +
+    theme(plot.title=element_text(size=13, hjust=-0.05,colour="royalblue4", face = "bold")
+    ,legend.position = "bottom"
+    ,legend.title = element_text(colour="royalblue3")
+    ,legend.text = element_text(colour="grey30")
+    ,axis.text.x = element_text(angle = 45, hjust = 1,size=7)
+    ,axis.title.x = element_text(colour="royalblue3")
+    ,axis.title.y = element_text(colour="royalblue3")
+    ,axis.ticks = element_line(color = "grey60")
+    ,axis.line = element_blank()
+    ,panel.background = element_rect(fill = "grey98")
+    ,panel.grid.minor = element_blank())
+
+
+customer_transaction_data[,.(sale_amt = sum(selling_price,na.rm = TRUE))
+                          ,.(coupon_discount)][order(-sale_amt)]
+
+customer_transaction_data[,.(sale_amt = sum(selling_price,na.rm = TRUE))
+                          ,.(coupon_discount)][order(-sale_amt)]
+
+for(i in colnames(customer_transaction_data[,.(quantity,selling_price,other_discount,coupon_discount)])){
+    
+    print(i)
+    head(customer_transaction_data[order(get(i))]) %>% print()
+    head(customer_transaction_data[order(-get(i))]) %>% print()
+}
+
+
+```
+
+
+
+### Merging data
+
+Transaction --> Item Data (item id)
+

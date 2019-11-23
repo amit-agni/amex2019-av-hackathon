@@ -1,0 +1,405 @@
+---
+title: "Initial Analysis"
+author: "Amit Agni"
+date: "28/09/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+if(!require(pacman)) { install.packages("pacman"); library(pacman)}
+p_load(data.table,tidyverse,tictoc,lubridate,here)
+p_load(janitor,DataExplorer)
+#remove scientific notation in printing 
+options(scipen=999) 
+#Revert back : options(scipen=0) 
+source(here::here("210_src_R-scripts-functions","functions","misc_functions.R"))
+source(here::here("210_src_R-scripts-functions","functions","db_functions.R"))
+
+rm(list = ls())
+gc()
+gc()
+
+```
+
+
+### Data Load
+
+```{r}
+filenames <- list.files(here('100_data_raw-input'),pattern = '*.csv')
+
+###Load all files
+for(i in filenames){
+    ##data frame name with only the census table names
+    df_name <- strsplit(i,"\\.")[[1]][1]
+    assign(df_name, fread(here("100_data_raw-input",i)))
+}
+
+
+```
+
+### Explore 1 record at a time
+
+```{r}
+
+camp_id <- 13
+cpn_id <- 22
+cust_id <- 781
+
+str(train)
+campaign_data[campaign_id ==camp_id]
+customer_demographics[customer_id == cust_id]
+
+train[coupon_id == cpn_id]
+
+train[campaign_id == camp_id & coupon_id == cpn_id & customer_id == cust_id]
+
+coupon_item_mapping[coupon_id == cpn_id][order(item_id)]
+
+customer_transaction_data[customer_id == cust_id][order(item_id)]
+
+merge(coupon_item_mapping[coupon_id == cpn_id]
+      ,customer_transaction_data[customer_id == cust_id]
+      ,by = 'item_id')
+
+merge(coupon_item_mapping
+      ,customer_transaction_data
+      ,by = 'item_id')
+
+
+#add campaign id in transaction
+DT_rev_sum[DT_sip,.(contract_number
+                    ,calrev
+                    ,x.proj_growth
+                    ,lower_percent__c
+                    ,upper_percent__c
+                    ,sip_percent__c
+                    ,tier_no)
+       ,on = .(contract_number = contract_number
+                                ,calrev = calrev
+                                , proj_growth >= lower_percent__c
+                                , proj_growth <= upper_percent__c)
+                       ,nomatch = 0]
+
+DT[X, .(x.x,x.y ,i.x,i.y,i.foo), on=.(x, y>=foo)]  # Select x's join columns as well
+
+#non-equi joins
+campaign_data[,`:=`(start_date = lubridate::dmy(start_date)
+                   ,end_date = lubridate::dmy(end_date))]
+
+customer_transaction_data[,date := ymd(date)]
+
+
+temp <- customer_transaction_data[campaign_data
+                                  ,on = .(date >= start_date
+                                  ,date <= end_date)
+                          ,nomatch = NA
+                          ,allow.cartesian = TRUE]
+temp
+
+temp <- campaign_data[customer_transaction_data
+                      ,.(x.campaign_id
+                         ,i.date
+                         ,i.customer_id
+                         ,i.item_id
+                         ,i.quantity
+                         ,i.selling_price
+                         ,i.other_discount
+                         ,i.coupon_discount)
+                      ,on = .(start_date <= date
+                              ,end_date >= date )
+                          ,nomatch = NA
+                          ,allow.cartesian = TRUE]
+
+temp2 <- temp[,.(campaign_id = paste(x.campaign_id,collapse = ','))
+     ,by = .(i.date
+                         ,i.customer_id
+                         ,i.item_id
+                         ,i.quantity
+                         ,i.selling_price
+                         ,i.other_discount
+                         ,i.coupon_discount)]
+
+temp2[!campaign_id %like% 'NA',.N,.(i.customer_id,campaign_id)]
+
+
+```
+
+
+### Explore individuals datasets
+
+### train and test
+
+```{r}
+
+str(train)
+plot_bar(train)
+plot_histogram(train)
+
+
+str(test)
+plot_bar(test)
+plot_histogram(test)
+
+
+head(get_dupes(train[,.(campaign_id,customer_id)]))
+head(get_dupes(train[,.(campaign_id,customer_id)]))
+
+
+str(train)
+
+train %>%
+    ggplot(.,aes(x=coupon_id)) +
+    geom_histogram() +
+    facet_wrap(~campaign_id) +
+    ggtitle("Coupon ids are reused within Campaigns : 8 and 13 standout")
+
+train %>%
+    ggplot(.,aes(x=customer_id)) +
+    geom_histogram() +
+    facet_wrap(~campaign_id) +
+    ggtitle("Coupon ids are reused within Campaigns")
+
+
+### coupon and item merge
+
+cpn_item <- merge(coupon_item_mapping
+                  ,item_data
+                  ,by = 'item_id'
+                  ,all.x = TRUE)
+
+#same coupon id is applied on dfferent products
+head(cpn_item[,.N,.(coupon_id,category)][order(coupon_id)])
+
+#same coupon ids are used accros brands
+cpn_item[,.N,.(coupon_id,brand)][order(coupon_id)][,-"N"] %>% get_dupes(.,coupon_id)
+cpn_item[,.N,.(coupon_id,brand)][order(coupon_id)][,-"N"] %>% get_dupes(.,brand)
+
+#same coupon is also used acros different categories
+cpn_item[,.N,.(coupon_id,category)][order(coupon_id)][,-"N"] %>% get_dupes(.,coupon_id)
+cpn_item[,.N,.(coupon_id,category)][order(coupon_id)][,-"N"] %>% get_dupes(.,category)
+
+
+
+#Combine train and test
+train$flag <- 'TRAIN'
+test$flag <- 'TEST'
+test$redemption_status <- NA
+train_test <- rbind(train,test)
+
+table(train_test$campaign_id,train_test$flag)
+
+str(test)
+str(sample_submission)
+
+```
+
+
+### Campaign_data
+```{r}
+str(campaign_data)
+#get_dupes(campaign_data,campaign_id)
+
+campaign_data[,`:=`(start_date = lubridate::dmy(start_date)
+                   ,end_date = lubridate::dmy(end_date)
+                   ,start_end = interval(start_date,end_date))]
+
+
+plot_bar(campaign_data)
+plot_histogram(campaign_data)
+
+min(campaign_data$start_date)
+max(campaign_data$end_date)
+
+
+#Campaigns run for
+t(t(table(campaign_data$end_date - campaign_data$start_date)))
+
+
+# #TO DO : use rolling joins to see if there are any interval overalaps
+# campaign_data[,start_end := lubridate::interval(start_date,end_date)]
+# 
+# all_intervals <- campaign_data$start_end
+# int1 <- campaign_data$start_end[1]
+# int1 == campaign_data$start_end 
+# length(which(int1 %within% all_intervals == TRUE))
+# 
+# campaign_data$is_bet_any_other <- NULL
+# campaign_data[,is_bet_any_other := length(which(start_end %within% all_intervals[start_end != all_intervals] == TRUE))]
+
+
+
+```
+
+### Customer demographics
+```{r}
+str(customer_demographics)
+# get_dupes(customer_demographics)
+# get_dupes(customer_demographics,customer_id)
+
+
+customer_demographics[customer_demographics == ''] <- NA
+
+customer_demographics <- customer_demographics %>%
+    mutate_if(is.character,as.factor)
+
+plot_bar(customer_demographics)
+plot_histogram(customer_demographics)
+
+plot_missing(customer_demographics)
+
+
+
+```
+
+
+### Item data
+```{r}
+str(item_data)
+
+plot_bar(item_data)
+plot_histogram(item_data)
+
+item_data <- item_data %>% mutate_if(is.character,as.factor)
+
+plot_correlation(item_data[,-1])
+
+get_dupes(item_data,item_id)
+
+
+```
+
+
+### Coupon Item
+
+```{r}
+
+str(coupon_item_mapping)
+plot_histogram(coupon_item_mapping)
+#get_dupes(coupon_item_mapping)
+
+head(get_dupes(coupon_item_mapping,coupon_id))
+head(get_dupes(coupon_item_mapping,item_id))
+
+
+```
+
+
+### Customer transaction
+
+```{r fig.width=12}
+str(customer_transaction_data)
+
+plot_histogram(customer_transaction_data)
+
+#unique(customer_transaction_data$date)
+customer_transaction_data[,date := ymd(date)]
+
+min(customer_transaction_data$date)
+max(customer_transaction_data$date)
+
+customer_transaction_data[,.(sale_amt = sum(selling_price,na.rm = TRUE))
+                          ,.(date)] %>%
+    ggplot() +
+    geom_line(aes(x=date,y=sale_amt)) +
+    scale_x_date(date_breaks = "weeks") +
+    theme_minimal() +
+    theme(plot.title=element_text(size=13, hjust=-0.05,colour="royalblue4", face = "bold")
+    ,legend.position = "bottom"
+    ,legend.title = element_text(colour="royalblue3")
+    ,legend.text = element_text(colour="grey30")
+    ,axis.text.x = element_text(angle = 45, hjust = 1,size=7)
+    ,axis.title.x = element_text(colour="royalblue3")
+    ,axis.title.y = element_text(colour="royalblue3")
+    ,axis.ticks = element_line(color = "grey60")
+    ,axis.line = element_blank()
+    ,panel.background = element_rect(fill = "grey98")
+    ,panel.grid.minor = element_blank())
+
+
+customer_transaction_data[,.(sale_amt = sum(selling_price,na.rm = TRUE))
+                          ,.(coupon_discount)][order(-sale_amt)]
+
+customer_transaction_data[,.(sale_amt = sum(selling_price,na.rm = TRUE))
+                          ,.(coupon_discount)][order(-sale_amt)]
+
+for(i in colnames(customer_transaction_data[,.(quantity,selling_price,other_discount,coupon_discount)])){
+    
+    print(i)
+    head(customer_transaction_data[order(get(i))]) %>% print()
+    head(customer_transaction_data[order(-get(i))]) %>% print()
+}
+
+
+```
+
+
+
+### Merging data
+
+Transaction --> Item Data (item id)
+
+
+
+```{r}
+
+train$flag <- 'TRAIN'
+test$flag <- 'TEST'
+test$redemption_status <- NA
+train_test <- rbind(train,test)
+
+
+tt_cust <- merge(train_test
+                 ,customer_demographics
+                 ,by = 'customer_id'
+                 ,all.x = TRUE)
+
+tt_cust_camp <- merge(tt_cust
+                      ,campaign_data
+                      ,by = 'campaign_id'
+                      ,all.x = TRUE)
+
+
+
+
+tran_item <- merge(customer_transaction_data
+                          ,item_data
+                          ,by = 'item_id'
+                          ,all.x = TRUE)
+
+
+temp <- left_join(tran_item,coupon_item_mapping, by = 'item_id') %>%
+    left_join(.,train_test,by = c('coupon_id','customer_id'))
+
+setDT(temp)
+temp <- temp[!is.na(campaign_id)]
+str(temp)
+
+tran_item_cpn <- merge(tran_item
+                       ,coupon_item_mapping
+                       ,by = 'item_id'
+                       ,all.x = TRUE
+                       ,allow.cartesian = TRUE)
+str(tran_item_cpn)
+#remove transactions that dont have a coupon id
+tran_item_cpn <- tran_item_cpn[!is.na(coupon_id)]
+
+
+
+
+left_join(x, y, by='Flag') %>%
+                left_join(., z, by='Flag') 
+
+str(train_test)
+tran_item_cpn_tt <- merge(tran_item_cpn
+                             ,train_test
+                             ,by = c('coupon_id','customer_id')
+                             ,all.x = TRUE)
+
+str(tran_item_cpn_tt)
+
+tran_item_cpn_tt[is.na(coupon_id)]
+
+```
+
